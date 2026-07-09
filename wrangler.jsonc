@@ -9,11 +9,39 @@
 	"compatibility_flags": [
 		"nodejs_compat"
 	],
-	"main": "@tanstack/react-start/server-entry",
+	"main": "src/server.ts",
 	"observability": {
 		"enabled": true
 	},
-	"upload_source_maps": true
+	"upload_source_maps": true,
+	"workflows": [
+		{
+			"binding": "SLIDES_WORKFLOW",
+			"name": "slides-workflow",
+			"class_name": "SlidesWorkflow"
+		}
+	],
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "slidesguy-db",
+			"database_id": "d9560893-e9b9-450f-90cf-07af79bc1279"
+		}
+	],
+	"r2_buckets": [
+		{
+			"binding": "BUCKET",
+			"bucket_name": "slidesguy-jobs"
+		}
+	],
+	"vars": {
+		"LLM_PROVIDER": "openai",
+		"LLM_MODEL": "gpt-4o",
+		"LLM_BASE_URL": "https://api.openai.com",
+		// Concurrent slide-generation LLM calls. Keep low on entry-level
+		// provider rate tiers (OpenAI tier 1 = 30k TPM); raise once upgraded.
+		"LLM_CONCURRENCY": "2"
+	}
 	/**
 	 * Smart Placement
 	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement

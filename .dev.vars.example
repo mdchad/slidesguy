@@ -1,0 +1,18 @@
+# Local dev secrets for the slides generator (copy to .dev.vars, which is gitignored).
+# Production equivalents are set with `wrangler secret put <NAME>`.
+
+# API key for the slide-generation LLM. Provider/model/base URL default to
+# OpenAI in wrangler.jsonc (LLM_PROVIDER=openai, LLM_MODEL=gpt-4o); override
+# any of them here for local dev.
+LLM_API_KEY=
+# LLM_PROVIDER=openai            # openai | anthropic
+# LLM_MODEL=gpt-4o
+# LLM_BASE_URL=https://api.openai.com   # host root; the provider path is appended
+
+# Failure-alert webhook. Leave empty to disable alerts (no-op).
+ALERT_WEBHOOK_URL=
+
+# Test-only fault injection for acceptance testing (never set in production):
+#   transient-twice:<slideIndex>  fail that slide's first two attempts retryably
+#   nonretryable:<slideIndex>     always fail that slide non-retryably
+# SLIDEGEN_FAULT=

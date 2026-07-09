@@ -1,5 +1,51 @@
 Welcome to your new TanStack Start app! 
 
+# Slides Generator
+
+Upload an `.xlsx` → an LLM plans and generates a slide deck → download a `.pptx` with native, editable charts. Spec: `docs/slides-generator-spec-v0.md`. Runs as a Cloudflare Workflow (`SlidesWorkflow`) exported from the custom server entry `src/server.ts`.
+
+## API
+
+- `POST /api/jobs` — multipart form with `file` (.xlsx, ≤10 MB) and optional `presentation_id`. Returns `202 {jobId}`. Requires an `X-User-Id` header (v0 auth stub).
+- `GET /api/jobs/:jobId` — poll status: `queued | processing | done | failed` (+ `failedStep`, `errorMsg`).
+- `GET /api/jobs/:jobId/download` — the finished `.pptx` (404 until `done`).
+
+## Setup
+
+- Local: copy `.dev.vars.example` to `.dev.vars` and set `LLM_API_KEY`. Apply migrations: `bunx wrangler d1 migrations apply slidesguy-db --local`.
+- LLM provider defaults to **OpenAI** (`LLM_PROVIDER=openai`, `LLM_MODEL=gpt-4o`, `LLM_BASE_URL=https://api.openai.com` in `wrangler.jsonc` `vars`). Uses OpenAI Chat Completions with JSON-object response mode. Set `LLM_PROVIDER=anthropic` to switch to the Anthropic Messages API instead; change the model/base URL to match.
+- Production: `wrangler secret put LLM_API_KEY` and (optionally) `wrangler secret put ALERT_WEBHOOK_URL`; `bunx wrangler d1 migrations apply slidesguy-db --remote` before first deploy.
+- **Workers Paid plan is effectively required**: the free plan caps CPU at 10 ms per Workflow step, which the pptxgenjs assemble step will exceed on any realistic deck.
+
+## R2 lifecycle rule (configure manually)
+
+R2 lifecycle rules match key **prefixes only** — the per-object-type expiry the spec wanted (`*/slides/*` after 2 days) is not expressible. Configure instead, on the `slidesguy-jobs` bucket: **expire objects under prefix `jobs/` after 30 days**. Tradeoff: intermediate fragments and plans live the full 30 days instead of 2; they are small JSON objects, so the cost is negligible, and keeping them preserves debuggability and the future partial-reuse option.
+
+## Testing
+
+Unit tests: `bun run test` (schemas, normalization, number verification, assembly/chart XML). End-to-end testing runs against the real LLM through the frontend: `bun run dev`, open `http://localhost:3000`, upload a spreadsheet. `bun scripts/make-fixtures.ts` writes sample `.xlsx` files to `tests/fixtures/` if you need upload material.
+
+Fault injection for retry testing: set `SLIDEGEN_FAULT=transient-twice:<idx>` or `nonretryable:<idx>` in `.dev.vars` (see `.dev.vars.example`).
+
+## Hallucination controls
+
+Three layers keep decks grounded in the uploaded spreadsheet:
+
+1. **Grounding prompts** — plan and slide prompts declare the spreadsheet the only source of truth and forbid metrics/concepts absent from it.
+2. **Charts computed by construction** — the LLM never writes chart numbers. It emits a query (`labelColumn` + per-series `columns` to sum + optional `groupBy`), and `chartdata.ts` computes the values from actual cells. Derived series (e.g. "Total expenses" across several columns, per-category aggregation) are supported. Prompts include computed column profiles (numeric/text/mixed) so the model picks valid columns; a bad query gets one repair re-prompt with the usable columns named, and if it still can't resolve, the chart is dropped and the slide ships as text (`evt: slide_chart_dropped`) rather than failing the deck.
+3. **Deck-level audit** (`audit` workflow step) — one extra LLM call reviews all slide prose against the data; flagged slides are regenerated once with the violations as feedback and the deck is re-audited. A deck that still fails audit fails the job (`failed_step='audit'`), with each violation logged as `evt: audit_flag`.
+
+**Memory check result (spec §13.8, run 2026-07-08):** a 60-slide deck with a native chart on every slide assembled successfully in local workerd (`vite dev`), producing a 1.8 MB `.pptx` (60 slide XMLs, 60 chart XMLs, no rasterized media); no OOM. Local dev does not enforce the production 128 MB isolate limit, so re-verify once after the first production deploy.
+
+## Support / debugging a failed job
+
+Given a `jobId` (or an account email → `SELECT * FROM jobs WHERE user_id = ? ORDER BY created_at DESC`):
+
+1. `wrangler d1 execute slidesguy-db --remote --command "SELECT * FROM jobs WHERE job_id = '<jobId>'"` — shows `status`, `failed_step`, `error_msg`.
+2. Workers observability logs: filter for the jobId; every failed attempt is logged as JSON (`evt: slide_fail | plan_fail | assemble_fail | job_failed`) including per-attempt errors.
+3. Cloudflare dashboard → Workflows → `slides-workflow` → instance id = jobId shows the errored step and retry history.
+4. Intermediate artifacts remain in R2 under `jobs/<jobId>/` (30-day lifecycle) for inspection.
+
 # Getting Started
 
 To run this application:
