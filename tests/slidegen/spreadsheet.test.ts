@@ -83,3 +83,48 @@ describe('parseWorkbook', () => {
     )
   })
 })
+
+describe('parseWorkbook — grouped headers and summary rows (real-world shape)', () => {
+  // Mirrors the "Expenses Pxielmind Studio" structure: group bands over
+  // vendor names, a nested sub-header, and Total/Profit rows in the data.
+  const grouped = [
+    [null, null, null, null, null],
+    [null, 'Revenue', null, 'Expenses', null],
+    [null, null, null, 'Wework', 'Domains'],
+    [null, null, null, null, 'Namecheap'],
+    ['march', 4426, null, 399, null],
+    ['april', 4458, null, 399, 20.92],
+    ['Total', 8884, null, 798, 20.92],
+    [null, null, 'Profit', 8086, null],
+  ]
+
+  it('merges group bands into column names', () => {
+    const { sheets } = parseWorkbook(xlsxBuffer(grouped))
+    expect(sheets[0].headers).toEqual([
+      'col_1',
+      'Revenue',
+      'Expenses / Wework',
+      'Expenses / Domains / Namecheap',
+    ])
+  })
+
+  it('extracts Total and Profit rows out of the data as summary facts', () => {
+    const { sheets } = parseWorkbook(xlsxBuffer(grouped))
+    expect(sheets[0].rows).toHaveLength(2) // march + april only
+    const labels = sheets[0].summaryFacts.map((f) => `${f.label}=${f.value}`)
+    expect(labels).toContain('Total — Revenue=8884')
+    expect(labels).toContain('Total — Expenses / Wework=798')
+    expect(labels).toContain('Profit=8086') // single value: no column suffix
+  })
+
+  it('treats a headerless numeric-first sheet as all data', () => {
+    const { sheets } = parseWorkbook(
+      xlsxBuffer([
+        ['Jan', 100],
+        ['Feb', 200],
+      ]),
+    )
+    expect(sheets[0].headers).toEqual(['col_1', 'col_2'])
+    expect(sheets[0].rows).toHaveLength(2)
+  })
+})

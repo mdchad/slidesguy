@@ -1,6 +1,7 @@
 import { z } from 'zod'
 
 import { describeColumns, runChartQuery } from './chartdata'
+import { verifiedFacts, verifiedFactsBlock } from './facts'
 import { logEvent, nonRetryable } from './errors'
 import { callLLM, extractJson } from './llm'
 import { coerceDeckPlan, coerceSlideSpec } from './normalize'
@@ -150,7 +151,11 @@ export async function generatePlan(
     '- The spreadsheet below is the ONLY source of truth. Use no outside knowledge about businesses, websites, or industries.',
     `- The available data is exactly: ${describeWorkbook(workbook)}. Plan slides about nothing else.`,
     '- Never plan a slide about a metric, category, or concept whose name does not appear in the data (for example: do not invent revenue streams, subscriptions, or advertising if those words are not in the spreadsheet).',
+    '- The data is sparse (many empty cells). Plan slides around what IS present; intents must not presuppose trends the data cannot show.',
     '- The closing takeaways slide may only restate findings that earlier slides support with this data.',
+    '',
+    'VERIFIED STATISTICS (computed in code from the full data — treat as ground truth):',
+    verifiedFactsBlock(workbook.sheets),
     '',
     'Spreadsheet data (rows shown may be truncated; totalRows is the real count, and rowRange may reference any row up to it):',
     JSON.stringify(truncateWorkbookRows(workbook, 80)),
@@ -217,6 +222,11 @@ export async function generateSlide(
     '- The data below is the ONLY source of truth. Use no outside knowledge.',
     '- Chart values are computed by the system from your query — never write them yourself.',
     '- Every claim in title, body, and notes must be verifiable from the data. Never mention metrics, categories, or concepts that do not appear in it.',
+    '- Any derived number you cite in prose (totals, averages, counts) MUST be copied verbatim from the VERIFIED STATISTICS below or from a visible cell. Never compute numbers yourself.',
+    '- The data is sparse: state absences as absences ("present in 4 of 12 months"). Never use trend words (surged, peaked, grew, consistent, stable, boosted) unless the verified statistics directly support them.',
+    '',
+    'VERIFIED STATISTICS (computed in code from the full sheet — cite these verbatim):',
+    ...verifiedFacts(sheetForSlide(workbook, planSlide)).map((l) => `- ${l}`),
     ...(groundingFeedback?.length
       ? [
           '',
@@ -299,19 +309,28 @@ export async function generateSlide(
 // One extra LLM call per deck: an auditor that sees every slide's prose plus
 // the source data and flags claims the data cannot support. Charts are
 // already verified deterministically, so the auditor focuses on text.
-export const AuditReport = z.object({
-  violations: z
+//
+// Each finding carries an explicit `supported` verdict: LLM judges given a
+// list called "violations" tend to fill it with everything they examined —
+// including claims their own reason text calls accurate. Forcing the verdict
+// makes that failure mode filterable: only supported=false findings count.
+const AuditFindings = z.object({
+  findings: z
     .array(
       z.object({
         index: z.number().int().min(0),
         claim: z.string().max(300),
         reason: z.string().max(300),
+        supported: z.boolean(),
       }),
     )
     .max(60),
 })
-export type AuditReportT = z.infer<typeof AuditReport>
-const auditJsonSchema = JSON.stringify(z.toJSONSchema(AuditReport))
+const auditJsonSchema = JSON.stringify(z.toJSONSchema(AuditFindings))
+
+export interface AuditReportT {
+  violations: Array<{ index: number; claim: string; reason: string }>
+}
 
 export async function auditDeck(
   config: LLMConfig,
@@ -328,22 +347,27 @@ export async function auditDeck(
   }))
 
   const prompt = [
-    'You are auditing a generated slide deck for hallucination against its source spreadsheet.',
-    'Flag ONLY clear violations: claims, metrics, categories, or concepts that do not appear in the data and cannot be derived from it.',
-    'Do NOT flag: restatements of data that is present, arithmetic derived from the data (totals, differences, percentages, averages), reasonable descriptive language, or stylistic choices.',
-    `Each violation needs the slide "index", the offending "claim" (quoted), and a short "reason". Return {"violations": []} if the deck is fully grounded.`,
+    'You are verifying a generated slide deck against its source spreadsheet.',
+    'Examine each slide and record findings. Every finding MUST carry a "supported" verdict:',
+    '- supported=false ONLY when a claim contradicts the data, or references metrics/categories/concepts that appear nowhere in it.',
+    '- supported=true for: restatements of present data, numbers matching the VERIFIED STATISTICS below (computed in code — they ARE ground truth, including min/max month attributions and presence lists), plainly derived arithmetic, descriptive language, or anything you are unsure about.',
+    'When in doubt, supported=true. Chart numbers are verified by code before you see them; your job is catching clear fabrications in prose, not auditing style.',
+    `Each finding needs the slide "index", the "claim" (quoted), a short "reason", and "supported". Return {"findings": []} when nothing is worth recording.`,
     '',
-    'Source data (rows shown may be truncated; judge concepts/categories by the headers and sample):',
+    'VERIFIED STATISTICS (computed in code from the full data — ground truth):',
+    verifiedFactsBlock(workbook.sheets),
+    '',
+    'Source data (rows shown may be truncated; judge by the headers, sample, and verified statistics):',
     JSON.stringify(truncateWorkbookRows(workbook, 40)),
     '',
     'Slides:',
     JSON.stringify(slidesForAudit),
   ].join('\n')
 
-  return generateValidated(
+  const report = await generateValidated(
     config,
     prompt,
-    AuditReport,
+    AuditFindings,
     auditJsonSchema,
     (raw) => raw,
     (attempt, err) =>
@@ -352,9 +376,16 @@ export async function auditDeck(
         attempt,
         err: String(err).slice(0, 500),
       }),
-    // Violations list is tiny; a big output reservation just burns TPM budget.
-    { maxTokens: 1500 },
+    // Findings list is tiny; a big output reservation just burns TPM budget.
+    { maxTokens: 2000 },
   )
+
+  // Only explicit unsupported verdicts count as violations.
+  return {
+    violations: report.findings
+      .filter((f) => !f.supported)
+      .map(({ index, claim, reason }) => ({ index, claim, reason })),
+  }
 }
 
 // Keep prompts inside provider TPM budgets: headers and a row sample carry
@@ -374,10 +405,15 @@ function describeWorkbook(workbook: ParsedWorkbook): string {
     .join('; ')
 }
 
-function sliceDataForSlide(workbook: ParsedWorkbook, planSlide: PlanSlideT) {
-  const sheet =
+function sheetForSlide(workbook: ParsedWorkbook, planSlide: PlanSlideT) {
+  return (
     workbook.sheets.find((s) => s.name === planSlide.sheet) ??
     workbook.sheets[0]
+  )
+}
+
+function sliceDataForSlide(workbook: ParsedWorkbook, planSlide: PlanSlideT) {
+  const sheet = sheetForSlide(workbook, planSlide)
   const rows = planSlide.rowRange
     ? sheet.rows.slice(planSlide.rowRange.start, planSlide.rowRange.end + 1)
     : sheet.rows

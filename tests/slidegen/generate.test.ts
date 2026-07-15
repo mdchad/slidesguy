@@ -23,6 +23,7 @@ const workbook = {
         ['Feb', 130],
       ],
       totalRows: 2,
+      summaryFacts: [],
     },
   ],
 } as unknown as ParsedWorkbook

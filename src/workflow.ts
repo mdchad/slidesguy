@@ -8,7 +8,7 @@ import {
   markProcessing,
   setTotalSlides,
 } from '#/lib/slidegen/db'
-import { logEvent, nonRetryable, truncateError } from '#/lib/slidegen/errors'
+import { logEvent, truncateError } from '#/lib/slidegen/errors'
 import { auditDeck, generatePlan, generateSlide } from '#/lib/slidegen/generate'
 import { r2keys } from '#/lib/slidegen/r2keys'
 import { DeckPlan, SlideSpec } from '#/lib/slidegen/slides'
@@ -134,14 +134,16 @@ export class SlidesWorkflow extends WorkflowEntrypoint<
         )
       }
 
-      // Deck-level grounding audit: one extra LLM call reviewing all prose
-      // against the source data; flagged slides get ONE repair regeneration
-      // and the deck is re-audited. A deck that still fails ships nothing —
-      // a failed job beats a confident hallucination.
+      // Deck-level grounding audit: an LLM call reviews all prose against the
+      // source data + code-computed statistics. Flagged slides regenerate
+      // with the violations as feedback, up to TWO repair rounds. Anything
+      // still flagged after that ships WITH logged warnings: the hard
+      // guarantees (chart values, verified statistics) are deterministic, and
+      // the auditor is a noisy judge — it must not brick decks.
       currentStep = 'audit'
       await step.do(
         'audit',
-        { ...LLM_RETRIES, timeout: '4 minutes' },
+        { ...LLM_RETRIES, timeout: '6 minutes' },
         async () => {
           const [planObj, sourceObj] = await Promise.all([
             env.BUCKET.get(r2keys.plan(jobId)),
@@ -163,50 +165,63 @@ export class SlidesWorkflow extends WorkflowEntrypoint<
             return specs
           }
 
-          const report = await auditDeck(llm, jobId, workbook, await loadSpecs())
-          if (report.violations.length === 0) return { flagged: 0 }
+          const MAX_REPAIR_ROUNDS = 2
+          let totalFlagged = 0
+          let round = 0
+          let report = await auditDeck(llm, jobId, workbook, await loadSpecs())
 
-          const byIndex = new Map<number, Array<string>>()
+          while (report.violations.length > 0 && round < MAX_REPAIR_ROUNDS) {
+            round++
+            totalFlagged += report.violations.length
+
+            const byIndex = new Map<number, Array<string>>()
+            for (const v of report.violations) {
+              logEvent('audit_flag', {
+                jobId,
+                round,
+                slideIndex: v.index,
+                claim: v.claim.slice(0, 200),
+                reason: v.reason.slice(0, 200),
+              })
+              if (v.index < plan.slides.length) {
+                const list = byIndex.get(v.index) ?? []
+                list.push(`"${v.claim}" — ${v.reason}`)
+                byIndex.set(v.index, list)
+              }
+            }
+
+            for (const [index, feedback] of byIndex) {
+              const spec = await generateSlide(
+                llm,
+                jobId,
+                plan.deckTitle,
+                plan.slides[index],
+                workbook,
+                undefined,
+                feedback,
+              )
+              await env.BUCKET.put(
+                r2keys.slide(jobId, index),
+                JSON.stringify(spec),
+              )
+            }
+
+            report = await auditDeck(llm, jobId, workbook, await loadSpecs())
+          }
+
           for (const v of report.violations) {
-            logEvent('audit_flag', {
+            logEvent('audit_unresolved', {
               jobId,
               slideIndex: v.index,
               claim: v.claim.slice(0, 200),
               reason: v.reason.slice(0, 200),
             })
-            if (v.index < plan.slides.length) {
-              const list = byIndex.get(v.index) ?? []
-              list.push(`"${v.claim}" — ${v.reason}`)
-              byIndex.set(v.index, list)
-            }
           }
-
-          for (const [index, feedback] of byIndex) {
-            const spec = await generateSlide(
-              llm,
-              jobId,
-              plan.deckTitle,
-              plan.slides[index],
-              workbook,
-              undefined,
-              feedback,
-            )
-            await env.BUCKET.put(
-              r2keys.slide(jobId, index),
-              JSON.stringify(spec),
-            )
+          return {
+            flagged: totalFlagged,
+            repairRounds: round,
+            unresolved: report.violations.length,
           }
-
-          const recheck = await auditDeck(llm, jobId, workbook, await loadSpecs())
-          if (recheck.violations.length > 0) {
-            throw nonRetryable(
-              `deck failed grounding audit after repair: ${recheck.violations
-                .map((v) => `slide ${v.index}: ${v.claim}`)
-                .join('; ')
-                .slice(0, 600)}`,
-            )
-          }
-          return { flagged: report.violations.length, repaired: byIndex.size }
         },
       )
 
